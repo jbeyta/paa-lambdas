@@ -56,8 +56,12 @@ async function listAudioFiles(event: APIGatewayProxyEventV2) {
   const params = event.queryStringParameters || {};
   const page = parseInt(params.page || "1");
   const pageSize = parseInt(params.pageSize || "10");
+  const tag = params.tag;
+  const search = params.search?.toLowerCase();
+  const sortBy = params.sortBy || "created_at";  // "created_at" or "title"
+  const sortOrder = params.sortOrder || "desc";   // "asc" or "desc"
 
-  // Query the GSI for sorted results
+  // Query the GSI for all items
   const result = await dynamo.send(new QueryCommand({
     TableName: process.env.AUDIO_FILES_TABLE,
     IndexName: "created_at-index",
@@ -65,26 +69,40 @@ async function listAudioFiles(event: APIGatewayProxyEventV2) {
     ExpressionAttributeValues: {
       ":type": { S: "AUDIO" },
     },
-    ScanIndexForward: false,  // Descending order (newest first)
-    Limit: pageSize * page,   // Fetch enough to paginate
+    ScanIndexForward: false,
   }));
 
-  const allItems = (result.Items || []).map(fromDynamo);
+  let items = (result.Items || []).map(fromDynamo);
+
+  // Filter by tag
+  if (tag) {
+    items = items.filter(item =>
+      item.tags && item.tags.includes(tag)
+    );
+  }
+
+  // Filter by search text (title and description)
+  if (search) {
+    items = items.filter(item =>
+      (item.title && item.title.toLowerCase().includes(search)) ||
+      (item.description && item.description.toLowerCase().includes(search))
+    );
+  }
+
+  // Sort
+  items.sort((a, b) => {
+    const aVal = a[sortBy] || "";
+    const bVal = b[sortBy] || "";
+    if (sortOrder === "asc") return aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+    return aVal > bVal ? -1 : aVal < bVal ? 1 : 0;
+  });
+
+  // Paginate
+  const totalCount = items.length;
   const start = (page - 1) * pageSize;
-  const paged = allItems.slice(start, start + pageSize);
+  const paged = items.slice(start, start + pageSize);
 
-  // Get total count
-  const countResult = await dynamo.send(new QueryCommand({
-    TableName: process.env.AUDIO_FILES_TABLE,
-    IndexName: "created_at-index",
-    KeyConditionExpression: "item_type = :type",
-    ExpressionAttributeValues: {
-      ":type": { S: "AUDIO" },
-    },
-    Select: "COUNT",
-  }));
-
-  return respond(200, { data: paged, totalCount: countResult.Count || 0 });
+  return respond(200, { data: paged, totalCount });
 }
 
 async function getAudioFile(id: string) {
@@ -95,6 +113,26 @@ async function getAudioFile(id: string) {
 
   if (!result.Item) return respond(404, { error: "Not found" });
   return respond(200, fromDynamo(result.Item));
+}
+
+async function listAllTags() {
+  const result = await dynamo.send(new QueryCommand({
+    TableName: process.env.AUDIO_FILES_TABLE,
+    IndexName: "created_at-index",
+    KeyConditionExpression: "item_type = :type",
+    ExpressionAttributeValues: {
+      ":type": { S: "AUDIO" },
+    },
+    ProjectionExpression: "tags",
+  }));
+
+  const allTags = new Set<string>();
+  for (const item of result.Items || []) {
+    const tags = item.tags?.L?.map((t: any) => t.S) || [];
+    tags.forEach((t: string) => allTags.add(t));
+  }
+
+  return respond(200, Array.from(allTags).sort());
 }
 
 async function createAudioFile(event: APIGatewayProxyEventV2) {
@@ -365,6 +403,7 @@ export const handler = async (
     // Audio files
     if (path === "/audio" && method === "GET") return await listAudioFiles(event);
     if (path === "/audio" && method === "POST") return await createAudioFile(event);
+    if (path === "/tags" && method === "GET") return await listAllTags();
 
     const audioMatch = path.match(/^\/audio\/([^/]+)$/);
     if (audioMatch) {

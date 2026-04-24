@@ -61,6 +61,10 @@ async function listAudioFiles(event) {
   const params = event.queryStringParameters || {};
   const page = parseInt(params.page || "1");
   const pageSize = parseInt(params.pageSize || "10");
+  const tag = params.tag;
+  const search = params.search?.toLowerCase();
+  const sortBy = params.sortBy || "created_at";
+  const sortOrder = params.sortOrder || "desc";
   const result = await dynamo.send(new import_client_dynamodb.QueryCommand({
     TableName: process.env.AUDIO_FILES_TABLE,
     IndexName: "created_at-index",
@@ -68,24 +72,29 @@ async function listAudioFiles(event) {
     ExpressionAttributeValues: {
       ":type": { S: "AUDIO" }
     },
-    ScanIndexForward: false,
-    // Descending order (newest first)
-    Limit: pageSize * page
-    // Fetch enough to paginate
+    ScanIndexForward: false
   }));
-  const allItems = (result.Items || []).map(fromDynamo);
+  let items = (result.Items || []).map(fromDynamo);
+  if (tag) {
+    items = items.filter(
+      (item) => item.tags && item.tags.includes(tag)
+    );
+  }
+  if (search) {
+    items = items.filter(
+      (item) => item.title && item.title.toLowerCase().includes(search) || item.description && item.description.toLowerCase().includes(search)
+    );
+  }
+  items.sort((a, b) => {
+    const aVal = a[sortBy] || "";
+    const bVal = b[sortBy] || "";
+    if (sortOrder === "asc") return aVal < bVal ? -1 : aVal > bVal ? 1 : 0;
+    return aVal > bVal ? -1 : aVal < bVal ? 1 : 0;
+  });
+  const totalCount = items.length;
   const start = (page - 1) * pageSize;
-  const paged = allItems.slice(start, start + pageSize);
-  const countResult = await dynamo.send(new import_client_dynamodb.QueryCommand({
-    TableName: process.env.AUDIO_FILES_TABLE,
-    IndexName: "created_at-index",
-    KeyConditionExpression: "item_type = :type",
-    ExpressionAttributeValues: {
-      ":type": { S: "AUDIO" }
-    },
-    Select: "COUNT"
-  }));
-  return respond(200, { data: paged, totalCount: countResult.Count || 0 });
+  const paged = items.slice(start, start + pageSize);
+  return respond(200, { data: paged, totalCount });
 }
 async function getAudioFile(id) {
   const result = await dynamo.send(new import_client_dynamodb.GetItemCommand({
@@ -94,6 +103,23 @@ async function getAudioFile(id) {
   }));
   if (!result.Item) return respond(404, { error: "Not found" });
   return respond(200, fromDynamo(result.Item));
+}
+async function listAllTags() {
+  const result = await dynamo.send(new import_client_dynamodb.QueryCommand({
+    TableName: process.env.AUDIO_FILES_TABLE,
+    IndexName: "created_at-index",
+    KeyConditionExpression: "item_type = :type",
+    ExpressionAttributeValues: {
+      ":type": { S: "AUDIO" }
+    },
+    ProjectionExpression: "tags"
+  }));
+  const allTags = /* @__PURE__ */ new Set();
+  for (const item of result.Items || []) {
+    const tags = item.tags?.L?.map((t) => t.S) || [];
+    tags.forEach((t) => allTags.add(t));
+  }
+  return respond(200, Array.from(allTags).sort());
 }
 async function createAudioFile(event) {
   const body = JSON.parse(event.body || "{}");
@@ -310,6 +336,7 @@ var handler = async (event) => {
   try {
     if (path === "/audio" && method === "GET") return await listAudioFiles(event);
     if (path === "/audio" && method === "POST") return await createAudioFile(event);
+    if (path === "/tags" && method === "GET") return await listAllTags();
     const audioMatch = path.match(/^\/audio\/([^/]+)$/);
     if (audioMatch) {
       const id = audioMatch[1];
